@@ -115,13 +115,58 @@ pass "the frequencies derive from the CPU rather than a model table"
 
 root=$(make_cpu_root 4000000 2800000)
 run_apply "$root" nonsense 2>/dev/null && fail "an unknown profile fails"
-pass "an unknown profile fails"
+[[ $(<"$root/intel_pstate/no_turbo") == 0 ]] ||
+  fail "an unknown profile leaves turbo untouched"
+[[ $(<"$root/cpu0/cpufreq/scaling_max_freq") == 2800000 ]] ||
+  fail "an unknown profile leaves the frequency cap untouched"
+pass "an unknown profile fails without touching CPU state"
+
+# Overlapping runs (watcher plus resume hook) must serialize: each run briefly
+# sets no_turbo=1, which a concurrent run would misread as the base clock.
+root=$(make_cpu_root 4000000 2800000)
+flock "$root/intel_pstate/no_turbo" bash -c 'touch "$1"; sleep 2' bash "$test_tmp/locked" &
+holder=$!
+until [[ -e $test_tmp/locked ]]; do :; done
+PATH="$test_tmp/bin:$PATH" OMARCHY_CPU_ROOT="$root" timeout 0.5 bash "$apply" balanced &&
+  fail "apply waits for a concurrent run to finish"
+wait $holder
+[[ $(<"$root/cpu0/cpufreq/scaling_max_freq") == 2800000 ]] ||
+  fail "a blocked apply has not written anything yet"
+pass "apply serializes against a concurrent run"
 
 root=$(make_cpu_root 4000000 2800000)
 chmod -w "$root/intel_pstate/no_turbo"
 run_apply "$root" balanced || fail "a read-only pstate is a no-op rather than an error"
 pass "a read-only pstate is a no-op rather than an error"
 chmod +w "$root/intel_pstate/no_turbo"
+
+# --- watch ----------------------------------------------------------------
+
+watch="$ROOT/bin/omarchy-powerprofiles-intel-no-hwp-watch"
+watch_tmp="$test_tmp/watch"
+mkdir -p "$watch_tmp"
+watch_log="$watch_tmp/log"
+
+cat >"$watch_tmp/gdbus" <<'SH'
+#!/bin/bash
+echo "Monitoring signals on object /net/hadess/PowerProfiles owned by net.hadess.PowerProfiles"
+echo "subscribed" >>"$WATCH_LOG"
+echo "The name net.hadess.PowerProfiles is owned by :1.20"
+echo "/net/hadess/PowerProfiles: org.freedesktop.DBus.Properties.PropertiesChanged ('net.hadess.PowerProfiles', {'ActiveProfile': <'balanced'>}, @as [])"
+SH
+
+cat >"$watch_tmp/omarchy-powerprofiles-intel-no-hwp-apply" <<'SH'
+#!/bin/bash
+echo "apply" >>"$WATCH_LOG"
+SH
+
+chmod +x "$watch_tmp"/*
+
+WATCH_LOG="$watch_log" PATH="$watch_tmp:$PATH" bash "$watch" ||
+  fail "the watcher runs cleanly"
+[[ $(<"$watch_log") == $'subscribed\napply\napply' ]] ||
+  fail "the watcher applies only after subscribing, then on each profile change" "$(cat "$watch_log")"
+pass "the watcher applies only after subscribing, then on each profile change"
 
 # --- leaf -----------------------------------------------------------------
 #
@@ -239,18 +284,23 @@ run_leaf 1 1 >/dev/null
 [[ -f $unit && -x $installed_hook ]] || fail "re-running the leaf is idempotent"
 pass "re-running the leaf is idempotent"
 
-if command -v systemd-analyze >/dev/null; then
+if ! command -v systemd-analyze >/dev/null; then
+  skip "systemd-analyze unavailable; skipping the live ordering-cycle check"
+elif [[ -z $(systemctl list-unit-files power-profiles-daemon.service --no-legend 2>/dev/null) ]]; then
+  skip "power-profiles-daemon.service not installed; skipping the live ordering-cycle check"
+else
   check_unit="$leaf_tmp/check.service"
   sed 's#^ExecStart=.*#ExecStart=/usr/bin/true#' "$unit" >"$check_unit"
 
   # Force the real power-profiles-daemon.service and its targets into the
   # graph: verifying the generated unit in isolation resolves referenced
   # units too shallowly to reproduce the cycle this test guards against.
+  # A failed verify means the graph never loaded, so it can't vouch for
+  # the absence of a cycle either.
   cycle_output=$(systemd-analyze verify multi-user.target graphical.target \
-    power-profiles-daemon.service "$check_unit" 2>&1) || true
+    power-profiles-daemon.service "$check_unit" 2>&1) ||
+    fail "systemd-analyze loads the generated unit alongside the real power-profiles-daemon.service unit" "$cycle_output"
   [[ $cycle_output != *"ordering cycle"* ]] ||
     fail "the generated unit has an ordering cycle against the real power-profiles-daemon.service unit" "$cycle_output"
   pass "the generated unit has no ordering cycle against the real power-profiles-daemon.service unit"
-else
-  pass "systemd-analyze unavailable; skipping the live ordering-cycle check"
 fi

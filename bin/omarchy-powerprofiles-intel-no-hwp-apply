@@ -18,6 +18,12 @@ fi
 
 profile="${1:-}"
 
+# The watcher and the resume hook can both run this at once, and each run briefly
+# sets no_turbo=1 to read the base clock, so an overlapping run would read that
+# temporary cap as base_freq. Hold a lock across the whole query-and-write.
+exec 9<"$PSTATE/no_turbo"
+flock 9
+
 if [[ -z $profile ]]; then
   profile=$(busctl get-property net.hadess.PowerProfiles /net/hadess/PowerProfiles \
     net.hadess.PowerProfiles ActiveProfile 2>/dev/null | awk '{gsub(/"/, ""); print $2}')
@@ -26,6 +32,15 @@ fi
 if [[ -z $profile ]]; then
   exit 0
 fi
+
+# Reject an unknown profile before touching any CPU state.
+case $profile in
+  performance | balanced | power-saver) ;;
+  *)
+    echo "Unknown power profile: $profile" >&2
+    exit 1
+    ;;
+esac
 
 # This unconditionally overwrites scaling_max_freq, which sounds like it could
 # fight a thermal daemon (thermald's Processor cooling devices, RAPL power
@@ -61,10 +76,6 @@ case $profile in
   power-saver)
     # no_turbo already clamps scaling_max_freq to the base clock.
     set_max_freq "$max_freq"
-    ;;
-  *)
-    echo "Unknown power profile: $profile" >&2
-    exit 1
     ;;
 esac
 

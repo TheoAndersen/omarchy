@@ -10,13 +10,15 @@
 BUS="net.hadess.PowerProfiles"
 OBJECT="/net/hadess/PowerProfiles"
 
-omarchy-powerprofiles-intel-no-hwp-apply
-
+# Apply the current profile only once gdbus reports the name's owner: that reply
+# comes after its signal subscription on the same connection, so a profile change
+# made while starting up is not lost between reading the profile and listening.
+# The line also repeats whenever power-profiles-daemon (re)appears on the bus.
 # Re-query on each signal instead of parsing the payload, so gdbus output
 # formatting is not load-bearing.
-gdbus monitor --system --dest "$BUS" --object-path "$OBJECT" 2>/dev/null |
+LC_ALL=C gdbus monitor --system --dest "$BUS" --object-path "$OBJECT" 2>/dev/null |
   while read -r line; do
-    if [[ $line == *ActiveProfile* ]]; then
+    if [[ $line == "The name $BUS "* || $line == *ActiveProfile* ]]; then
       omarchy-powerprofiles-intel-no-hwp-apply
     fi
   done
